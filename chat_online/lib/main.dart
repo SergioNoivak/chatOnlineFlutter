@@ -1,6 +1,12 @@
+import 'dart:io';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
+import 'package:google_sign_in/google_sign_in.dart';
+import 'package:image_picker/image_picker.dart';
 
 void main() {
   // Firestore.instance.collection("mensagens").document().setData({"from":"Daniel","texto":"Ola"});
@@ -14,6 +20,38 @@ final ThemeData themeIOS = ThemeData(
 
 final ThemeData themeDefault = ThemeData(
     primarySwatch: Colors.purple, accentColor: Colors.orangeAccent[400]);
+
+final googleSignIn = GoogleSignIn();
+final auth = FirebaseAuth.instance;
+
+Future<Null> _ensureLoggedIn() async {
+  GoogleSignInAccount user = googleSignIn.currentUser;
+  if (user == null) user = await googleSignIn.signInSilently();
+
+  if (user == null) user = await googleSignIn.signIn();
+
+  if (await auth.currentUser() == null) {
+    GoogleSignInAuthentication credentials =
+        await googleSignIn.currentUser.authentication;
+    await auth.signInWithCredential(GoogleAuthProvider.getCredential(
+        idToken: credentials.idToken, accessToken: credentials.accessToken));
+  }
+}
+
+_handleSubmitted(String text) async {
+  await _ensureLoggedIn();
+  _sendMessage(text: text);
+}
+
+void _sendMessage({String text, String imgUrl}) {
+  Firestore.instance.collection("messages").add({
+    "text": text,
+    "imgUrl": imgUrl,
+    "senderName": googleSignIn.currentUser.displayName,
+    "senderPhotoUrl": googleSignIn.currentUser.photoUrl,
+    "senderDate": new DateTime.now().toIso8601String()
+  });
+}
 
 class MyApp extends StatelessWidget {
   @override
@@ -49,6 +87,28 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
         body: Column(
           children: <Widget>[
+            Expanded(
+                child: StreamBuilder(
+              stream: Firestore.instance
+                  .collection("messages")
+                  .orderBy('senderDate')
+                  .snapshots(),
+              builder: (context, snapshot) {
+                switch (snapshot.connectionState) {
+                  case ConnectionState.none:
+                  case ConnectionState.waiting:
+                    return Center(child: CircularProgressIndicator());
+
+                  default:
+                    return ListView.builder(
+                      itemCount: snapshot.data.documents.length,
+                      itemBuilder: (context, index) {
+                        return ChatMessage(snapshot.data.documents[index].data);
+                      },
+                    );
+                }
+              },
+            )),
             Container(
               decoration: BoxDecoration(color: Theme.of(context).cardColor),
               child: TextComposer(),
@@ -66,7 +126,14 @@ class TextComposer extends StatefulWidget {
 }
 
 class _TextComposerState extends State<TextComposer> {
+  reset() {
+    this.controllerText.clear();
+    setState(() {
+      _isComposing = false;
+    });
+  }
 
+  final controllerText = TextEditingController();
   bool _isComposing = false;
   @override
   Widget build(BuildContext context) {
@@ -84,28 +151,98 @@ class _TextComposerState extends State<TextComposer> {
             children: <Widget>[
               Container(
                 child: IconButton(
-                    icon: Icon(Icons.photo_camera), onPressed: () {}),
+                    icon: Icon(Icons.photo_camera),
+                    onPressed: () async {
+                      await _ensureLoggedIn();
+                      File fileImg = await ImagePicker.pickImage(
+                          source: ImageSource.camera);
+                      if (fileImg == null) return;
+                      StorageUploadTask task = FirebaseStorage.instance
+                          .ref()
+                          .child(googleSignIn.currentUser.id.toString() +
+                              DateTime.now().millisecondsSinceEpoch.toString())
+                          .putFile(fileImg);
+                      StorageTaskSnapshot taskSnapshot = await task.onComplete;
+                      String url = await taskSnapshot.ref.getDownloadURL();
+                      _sendMessage(imgUrl: url);
+                    }),
               ),
-             
-              Expanded(child: 
-              TextField(decoration: InputDecoration.collapsed(hintText: "Enviar uma mensagem..."),
-                onChanged: (text){
-
+              Expanded(
+                child: TextField(
+                  controller: controllerText,
+                  decoration: InputDecoration.collapsed(
+                      hintText: "Enviar uma mensagem..."),
+                  onChanged: (text) {
                     setState(() {
-                    _isComposing = text.length>0;
+                      _isComposing = text.length > 0;
                     });
-
-
-                },
-              )
-              ,),
-
-                Container(
-                    margin: EdgeInsets.symmetric(horizontal: 4.0),
-
-                )
+                  },
+                  onSubmitted: (text) {
+                    _handleSubmitted(text);
+                    reset();
+                  },
+                ),
+              ),
+              Container(
+                  margin: EdgeInsets.symmetric(horizontal: 4.0),
+                  child: Theme.of(context).platform == TargetPlatform.iOS
+                      ? CupertinoButton(
+                          child: Text("Enviar"),
+                          onPressed: this._isComposing
+                              ? () {
+                                  _handleSubmitted(controllerText.text);
+                                  reset();
+                                }
+                              : null)
+                      : IconButton(
+                          icon: Icon(Icons.send),
+                          onPressed: this._isComposing
+                              ? () {
+                                  _handleSubmitted(controllerText.text);
+                                  reset();
+                                }
+                              : null))
             ],
           ),
         ));
+  }
+}
+
+class ChatMessage extends StatelessWidget {
+  Map<String, dynamic> data;
+
+  ChatMessage(this.data);
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: EdgeInsets.symmetric(vertical: 10.0, horizontal: 10.0),
+      child: Row(
+        children: <Widget>[
+          Container(
+            margin: const EdgeInsets.only(right: 16),
+            child: CircleAvatar(
+              backgroundImage: NetworkImage(data["senderPhotoUrl"]),
+            ),
+          ),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  data["senderName"],
+                  style: Theme.of(context).textTheme.subhead,
+                ),
+                Container(
+                    margin: const EdgeInsets.only(top: 5),
+                    child: data["imgUrl"] != null
+                        ? Image.network(data["imgUrl"], width: 250)
+                        : Text(data['text']))
+              ],
+            ),
+          )
+        ],
+      ),
+    );
   }
 }
